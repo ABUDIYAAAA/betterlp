@@ -6,12 +6,14 @@ from django.views.decorators.csrf import csrf_exempt
 from .models import UserToken
 import json
 from django.shortcuts import redirect
+from django.contrib.auth.models import User
+from .models import Profile, ProfileUser
 
 # Replace or add these in your settings.py
 CLIENT_ID = "a1358e7bde1741bd9a7d0242d77dd9fb"
 CLIENT_SECRET = "772fe3710f7d4491b8202bf52e1a0b2b"
-REDIRECT_URI = r"http://127.0.0.1:8000/callback"
-SCOPE = "user-read-playback-state user-modify-playback-state"
+REDIRECT_URI = r"https://abudiyaaaaa.pythonanywhere.com/callback"
+SCOPE = "user-read-playback-state user-modify-playback-state user-read-private"
 
 
 def login(request):
@@ -85,11 +87,12 @@ def save_tokens(request):
                     "refresh_token": token_data.get("refresh_token", ""),
                 },
             )
-            return redirect("https://discord.com/app")  # Redirect back to Discord
-        else:
-            return JsonResponse(
-                {"error": "Failed to exchange code for tokens"}, status=400
+            return HttpResponse(
+                f"<h2>✅ Auth successful!</h2>"
+                f'<p><a href="discord://">Click here to open Discord</a></p>'
             )
+    else:
+        return HttpResponse(f"❌ Error: {token_data}")
 
     if request.method == "POST":
         code = request.POST.get("code")
@@ -130,12 +133,43 @@ def save_tokens(request):
     return JsonResponse({"error": "Method not allowed"}, status=405)
 
 
+@csrf_exempt  # Add this decorator to exempt CSRF checks
 def verify_tokens(request, discord_user_id):
     try:
+        # Log the request method and headers for debugging
+        print(f"Request method: {request.method}")
+        print(f"Request headers: {request.headers}")
+
         user_token = UserToken.objects.get(discord_user_id=discord_user_id)
-        return JsonResponse({"linked": True})
+        access_token = user_token.access_token
+
+        # Test if the token is still valid by making a request to Spotify's API
+        headers = {"Authorization": f"Bearer {access_token}"}
+        response = requests.get("https://api.spotify.com/v1/me", headers=headers)
+
+        if response.status_code == 200:
+            return JsonResponse({"linked": True, "valid": True})
+        elif response.status_code == 401:
+            # Token is invalid or expired
+            return JsonResponse(
+                {"linked": True, "valid": False, "error": "Invalid or expired token"}
+            )
+        else:
+            return JsonResponse(
+                {"linked": True, "valid": False, "error": response.text},
+                status=response.status_code,
+            )
     except UserToken.DoesNotExist:
-        return JsonResponse({"linked": False})
+        return JsonResponse(
+            {"linked": False, "valid": False, "error": "No token found"}
+        )
+    except Exception as e:
+        # Log unexpected errors for debugging
+        print(f"Unexpected error: {str(e)}")
+        return JsonResponse(
+            {"linked": False, "valid": False, "error": f"Unexpected error: {str(e)}"},
+            status=500,
+        )
 
 
 def get_currently_playing(request, discord_user_id):
@@ -170,7 +204,11 @@ def get_currently_playing(request, discord_user_id):
                     }
                 )
             else:
-                return JsonResponse({"is_playing": False})
+                return JsonResponse(
+                    {"is_playing": False, "message": "Not playing anything"}
+                )
+        elif response.status_code == 401:
+            return JsonResponse({"error": "Invalid or expired token"}, status=401)
         else:
             return JsonResponse(
                 {"error": "Failed to fetch currently playing track"},
@@ -178,3 +216,47 @@ def get_currently_playing(request, discord_user_id):
             )
     except UserToken.DoesNotExist:
         return JsonResponse({"error": "User token not found"}, status=404)
+
+
+@csrf_exempt
+def create_profile(request):
+    """Create or retrieve a profile for the given username."""
+    if request.method == "POST":
+        data = json.loads(request.body)
+        user, _ = User.objects.get_or_create(username=data["username"])
+        profile, created = Profile.objects.get_or_create(
+            owner=user,
+            defaults={"name": data.get("name", f"{user.username}'s Profile")},
+        )
+        return JsonResponse({"profile_id": profile.id, "created": created})
+
+
+@csrf_exempt
+def add_user_to_profile(request):
+    """Add a user to the profile of the given username."""
+    if request.method == "POST":
+        data = json.loads(request.body)
+        user = User.objects.get(username=data["username"])
+        profile = Profile.objects.get(
+            owner=user
+        )  # Automatically retrieve the user's profile
+        profile_user, created = ProfileUser.objects.get_or_create(
+            profile=profile, discord_user_id=data["discord_user_id"]
+        )
+        return JsonResponse({"profile_user_id": profile_user.id, "created": created})
+
+
+@csrf_exempt
+def update_user_settings(request):
+    """Update settings for a user in a profile."""
+    if request.method == "POST":
+        data = json.loads(request.body)
+        profile_user = ProfileUser.objects.get(id=data["profile_user_id"])
+        profile_user.forward_permission = data.get(
+            "forward_permission", profile_user.forward_permission
+        )
+        profile_user.add_to_queue_permission = data.get(
+            "add_to_queue_permission", profile_user.add_to_queue_permission
+        )
+        profile_user.save()
+        return JsonResponse({"success": True})

@@ -25,7 +25,7 @@ SECRET_KEY = "django-insecure-qcyaujtjq^99@_7&2*x2gy=o51gick#i7u3&ygrau4ph#mo-n(
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = True
 
-ALLOWED_HOSTS = []
+ALLOWED_HOSTS = ["*"]
 
 
 # Application definition
@@ -38,9 +38,11 @@ INSTALLED_APPS = [
     "django.contrib.messages",
     "django.contrib.staticfiles",
     "dasme",
+    "corsheaders",  # Ensure this is included
 ]
 
 MIDDLEWARE = [
+    "corsheaders.middleware.CorsMiddleware",  # Ensure this is included
     "django.middleware.security.SecurityMiddleware",
     "django.contrib.sessions.middleware.SessionMiddleware",
     "django.middleware.common.CommonMiddleware",
@@ -122,3 +124,17 @@ STATIC_URL = "static/"
 # https://docs.djangoproject.com/en/4.2/ref/settings/#default-auto-field
 
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
+
+# CORS configuration
+CORS_ALLOW_ALL_ORIGINS = True  # Allow all origins (for development purposes)
+
+# CSRF configuration
+CSRF_TRUSTED_ORIGINS = [
+    "https://abudiyaaaaa.pythonanywhere.com",  # Add your server's domain
+    "http://localhost",  # Add localhost for testing
+    "http://127.0.0.1",  # Add loopback address for testing
+    # Add any other domains from which requests might originate
+]
+
+# Ensure CSRF is exempt for API endpoints if necessary
+CSRF_COOKIE_SECURE = True  # Ensure CSRF cookies are sent over HTTPS

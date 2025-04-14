@@ -22,18 +22,4 @@ from dasme import views
 urlpatterns = [
     path("admin/", admin.site.urls),
     path("", include("dasme.urls")),
-    path("api/save_tokens/", views.save_tokens, name="save_tokens"),
-    path(
-        "api/verify_tokens/<int:discord_user_id>/",
-        views.verify_tokens,
-        name="verify_tokens",
-    ),
-    path(
-        "callback", views.save_tokens, name="callback"
-    ),  # Handle GET requests for callback
-    path(
-        "api/get_currently_playing/<int:discord_user_id>/",
-        views.get_currently_playing,
-        name="get_currently_playing",
-    ),
 ]

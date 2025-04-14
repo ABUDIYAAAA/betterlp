@@ -30,6 +30,7 @@ class Friendship(models.Model):
 
 class Track(models.Model):
     song_id = models.CharField(max_length=255, unique=False)
+    song_name = models.CharField(max_length=255, unique=False, blank=True)
     requester = models.ForeignKey(
         User, on_delete=models.CASCADE, related_name="requested_tracks"
     )

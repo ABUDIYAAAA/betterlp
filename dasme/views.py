@@ -3,7 +3,7 @@ from django.http import HttpResponse, HttpResponseRedirect, JsonResponse
 from django.conf import settings
 from urllib.parse import urlencode
 from django.views.decorators.csrf import csrf_exempt
-from .models import UserToken
+from .models import UserToken, ListenParty
 import json
 from django.shortcuts import redirect
 from django.contrib.auth.models import User
@@ -39,7 +39,7 @@ def save_tokens(request):
 
         if "access_token" in token_data:
             UserToken.objects.update_or_create(
-                owner=User.objects.get(username=state),
+                owner=User.objects.get(id=state),
                 discord_user_id=state,
                 defaults={
                     "access_token": token_data["access_token"],
@@ -169,8 +169,65 @@ def create_profile(request):
     """Create or retrieve a profile for the given username."""
     if request.method == "POST":
         data = json.loads(request.body)
-        user, c = User.objects.get_or_create(username=data["username"])
+        user, c = User.objects.get_or_create(username=data["username"], id=data["id"])
         return JsonResponse({"user_id": user.id, "created": c})
+
+
+@csrf_exempt
+def create_lp(request):
+    """Create a new Listen Party."""
+    if request.method == "POST":
+        try:
+            data = json.loads(request.body)
+            user = User.objects.get(id=data["owner"])
+            obj, created = ListenParty.objects.get_or_create(
+                owner=user,
+            )
+            obj.connected.add(user)
+            obj.save()
+            return JsonResponse({"created": created}, status=200)
+        except Exception as e:
+            return JsonResponse({"error": str(e)}, status=400)
+
+
+@csrf_exempt
+def lp_info(request):
+    """Get information about the current Listen Party."""
+    try:
+        data = json.loads(request.body)
+        user = User.objects.get(id=data["owner"])
+
+        # Try to find a ListenParty the user owns
+        obj = (
+            ListenParty.objects.prefetch_related("que", "connected")
+            .filter(owner=user)
+            .first()
+        )
+
+        if not obj:
+            # Try to find a ListenParty where the user is connected
+            obj = (
+                ListenParty.objects.prefetch_related("que", "connected")
+                .filter(connected=user)
+                .first()
+            )
+
+        if not obj:
+            return JsonResponse({"error": "ListenParty not found."}, status=404)
+
+        que = [t.song_name for t in obj.que.all()]
+        connected_users = [u.username for u in obj.connected.all()]
+
+        return JsonResponse(
+            {"owner": obj.owner.username, "que": que, "connected": connected_users}
+        )
+
+    except User.DoesNotExist:
+        return JsonResponse({"error": "User not found."}, status=404)
+    except json.JSONDecodeError:
+        return JsonResponse({"error": "Invalid JSON."}, status=400)
+    except Exception as e:
+        return JsonResponse({"error": str(e)}, status=500)
 
 
 # @csrf_exempt

@@ -16,6 +16,8 @@ urlpatterns = [
     ),
     # Profile management routes
     path("api/create_profile/", views.create_profile, name="create_profile"),
+    path("api/lp_create/", views.create_lp, name="create_lp"),
+    path("api/lp_info/", views.lp_info, name="lp_info"),
     #     path(
     #         "api/add_user_to_profile/",
     #         views.add_user_to_profile,

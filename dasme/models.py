@@ -1,4 +1,5 @@
 from django.db import models
+from django.contrib.auth.models import User
 
 
 class UserToken(models.Model):
@@ -11,19 +12,32 @@ class UserToken(models.Model):
         return f"Discord User ID: {self.discord_user_id}"
 
 
-class Profile(models.Model):
-    owner = models.OneToOneField("auth.User", on_delete=models.CASCADE)
-    name = models.CharField(max_length=100)
+class Friendship(models.Model):
+    user = models.ForeignKey(User, related_name="friendships", on_delete=models.CASCADE)
+    friend = models.ForeignKey(
+        User, related_name="related_to_friendships", on_delete=models.CASCADE
+    )
+
+    can_forward = models.BooleanField(default=False)
+    can_que = models.BooleanField(default=True)
+
+    class Meta:
+        unique_together = ("user", "friend")
 
     def __str__(self):
-        return self.name
+        return f"{self.user.username} ↔ {self.friend.username}"
 
 
-class ProfileUser(models.Model):
-    profile = models.ForeignKey(Profile, on_delete=models.CASCADE, related_name="users")
-    discord_user_id = models.BigIntegerField()
-    forward_permission = models.BooleanField(default=False)
-    add_to_queue_permission = models.BooleanField(default=False)
+class Track(models.Model):
+    song_id = models.CharField(max_length=255, unique=False)
+    requester = models.ForeignKey(
+        User, on_delete=models.CASCADE, related_name="requested_tracks"
+    )
 
-    def __str__(self):
-        return f"{self.discord_user_id} in {self.profile.name}"
+
+class ListenParty(models.Model):
+    que = models.ManyToManyField(Track, blank=True, related_name="ques_tracks")
+    owner = models.ForeignKey(
+        User, on_delete=models.CASCADE, related_name="owner_party"
+    )
+    connected = models.ManyToManyField(User, blank=True, related_name="connected_users")

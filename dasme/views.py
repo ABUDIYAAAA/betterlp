@@ -7,54 +7,12 @@ from .models import UserToken
 import json
 from django.shortcuts import redirect
 from django.contrib.auth.models import User
-from .models import Profile, ProfileUser
 
 # Replace or add these in your settings.py
 CLIENT_ID = "a1358e7bde1741bd9a7d0242d77dd9fb"
 CLIENT_SECRET = "772fe3710f7d4491b8202bf52e1a0b2b"
 REDIRECT_URI = r"https://abudiyaaaaa.pythonanywhere.com/callback"
 SCOPE = "user-read-playback-state user-modify-playback-state user-read-private"
-
-
-def login(request):
-    params = urlencode(
-        {
-            "response_type": "code",
-            "client_id": CLIENT_ID,
-            "scope": SCOPE,
-            "redirect_uri": REDIRECT_URI,
-        }
-    )
-    return HttpResponseRedirect(f"https://accounts.spotify.com/authorize?{params}")
-
-
-def callback(request):
-    code = request.GET.get("code")
-
-    token_res = requests.post(
-        "https://accounts.spotify.com/api/token",
-        data={
-            "grant_type": "authorization_code",
-            "code": code,
-            "redirect_uri": REDIRECT_URI,
-            "client_id": CLIENT_ID,
-            "client_secret": CLIENT_SECRET,
-        },
-    )
-
-    token_data = token_res.json()
-
-    if "access_token" in token_data:
-        access_token = token_data["access_token"]
-        refresh_token = token_data.get("refresh_token", "❌ Not returned")
-        return HttpResponse(
-            f"<h2>✅ Auth successful!</h2>"
-            f"<p><strong>Access Token:</strong> {access_token}</p>"
-            f"<p><strong>Refresh Token:</strong> {refresh_token}</p>"
-            f"<p>Copy these tokens and close the window.</p>"
-        )
-    else:
-        return HttpResponse(f"❌ Error: {token_data}")
 
 
 @csrf_exempt
@@ -74,13 +32,14 @@ def save_tokens(request):
                 "code": code,
                 "redirect_uri": REDIRECT_URI,
                 "client_id": CLIENT_ID,
-                "client_secret": "772fe3710f7d4491b8202bf52e1a0b2b",  # Spotify Client Secret
+                "client_secret": CLIENT_SECRET,  # Spotify Client Secret
             },
         )
         token_data = token_res.json()
 
         if "access_token" in token_data:
             UserToken.objects.update_or_create(
+                owner=User.objects.get(username=state),
                 discord_user_id=state,
                 defaults={
                     "access_token": token_data["access_token"],
@@ -91,44 +50,6 @@ def save_tokens(request):
                 f"<h2>✅ Auth successful!</h2>"
                 f'<p><a href="discord://">Click here to open Discord</a></p>'
             )
-    else:
-        return HttpResponse(f"❌ Error: {token_data}")
-
-    if request.method == "POST":
-        code = request.POST.get("code")
-        state = request.POST.get("state")  # Discord user ID passed as state
-
-        if not code or not state:
-            return JsonResponse({"error": "Missing code or state"}, status=400)
-
-        # Exchange the authorization code for tokens
-        token_res = requests.post(
-            "https://accounts.spotify.com/api/token",
-            data={
-                "grant_type": "authorization_code",
-                "code": code,
-                "redirect_uri": REDIRECT_URI,
-                "client_id": CLIENT_ID,
-                "client_secret": CLIENT_SECRET,  # Spotify Client Secret
-            },
-        )
-        token_data = token_res.json()
-
-        if "access_token" in token_data:
-            UserToken.objects.update_or_create(
-                discord_user_id=state,
-                defaults={
-                    "access_token": token_data["access_token"],
-                    "refresh_token": token_data.get("refresh_token", ""),
-                },
-            )
-            return HttpResponseRedirect(
-                "https://discord.com/app"
-            )  # Redirect back to Discord
-        else:
-            return JsonResponse(
-                {"error": "Failed to exchange code for tokens"}, status=400
-            )
 
     return JsonResponse({"error": "Method not allowed"}, status=405)
 
@@ -136,24 +57,49 @@ def save_tokens(request):
 @csrf_exempt  # Add this decorator to exempt CSRF checks
 def verify_tokens(request, discord_user_id):
     try:
-        # Log the request method and headers for debugging
-        print(f"Request method: {request.method}")
-        print(f"Request headers: {request.headers}")
-
         user_token = UserToken.objects.get(discord_user_id=discord_user_id)
         access_token = user_token.access_token
-
-        # Test if the token is still valid by making a request to Spotify's API
+        refresh_token = user_token.refresh_token
         headers = {"Authorization": f"Bearer {access_token}"}
         response = requests.get("https://api.spotify.com/v1/me", headers=headers)
 
         if response.status_code == 200:
             return JsonResponse({"linked": True, "valid": True})
         elif response.status_code == 401:
-            # Token is invalid or expired
-            return JsonResponse(
-                {"linked": True, "valid": False, "error": "Invalid or expired token"}
-            )
+            url = "https://accounts.spotify.com/api/token"
+
+            # Prepare headers and body
+            headers = {"Content-Type": "application/x-www-form-urlencoded"}
+
+            data = {
+                "grant_type": "refresh_token",
+                "refresh_token": refresh_token,
+                "client_id": CLIENT_ID,
+            }
+
+            response = requests.post(url, headers=headers, data=data)
+
+            if response.status_code == 200:
+                # Parse the response
+                response_data = response.json()
+
+                # Store the new access token
+                access_token = response_data["access_token"]
+                refresh_token = response_data["refresh_token"]
+
+                if access_token and refresh_token:
+                    user_token.access_token = access_token
+                    user_token.refresh_token = refresh_token
+                    user_token.save()
+                    return JsonResponse({"linked": True, "valid": True})
+                else:
+                    return JsonResponse(
+                        {
+                            "linked": True,
+                            "valid": False,
+                            "error": "Invalid or expired token",
+                        }
+                    )
         else:
             return JsonResponse(
                 {"linked": True, "valid": False, "error": response.text},
@@ -223,40 +169,36 @@ def create_profile(request):
     """Create or retrieve a profile for the given username."""
     if request.method == "POST":
         data = json.loads(request.body)
-        user, _ = User.objects.get_or_create(username=data["username"])
-        profile, created = Profile.objects.get_or_create(
-            owner=user,
-            defaults={"name": data.get("name", f"{user.username}'s Profile")},
-        )
-        return JsonResponse({"profile_id": profile.id, "created": created})
+        user, c = User.objects.get_or_create(username=data["username"])
+        return JsonResponse({"user_id": user.id, "created": c})
 
 
-@csrf_exempt
-def add_user_to_profile(request):
-    """Add a user to the profile of the given username."""
-    if request.method == "POST":
-        data = json.loads(request.body)
-        user = User.objects.get(username=data["username"])
-        profile = Profile.objects.get(
-            owner=user
-        )  # Automatically retrieve the user's profile
-        profile_user, created = ProfileUser.objects.get_or_create(
-            profile=profile, discord_user_id=data["discord_user_id"]
-        )
-        return JsonResponse({"profile_user_id": profile_user.id, "created": created})
+# @csrf_exempt
+# def add_user_to_profile(request):
+#     """Add a user to the profile of the given username."""
+#     if request.method == "POST":
+#         data = json.loads(request.body)
+#         user = User.objects.get(username=data["username"])
+#         profile = Profile.objects.get(
+#             owner=user
+#         )  # Automatically retrieve the user's profile
+#         profile_user, created = ProfileUser.objects.get_or_create(
+#             profile=profile, discord_user_id=data["discord_user_id"]
+#         )
+#         return JsonResponse({"profile_user_id": profile_user.id, "created": created})
 
 
-@csrf_exempt
-def update_user_settings(request):
-    """Update settings for a user in a profile."""
-    if request.method == "POST":
-        data = json.loads(request.body)
-        profile_user = ProfileUser.objects.get(id=data["profile_user_id"])
-        profile_user.forward_permission = data.get(
-            "forward_permission", profile_user.forward_permission
-        )
-        profile_user.add_to_queue_permission = data.get(
-            "add_to_queue_permission", profile_user.add_to_queue_permission
-        )
-        profile_user.save()
-        return JsonResponse({"success": True})
+# @csrf_exempt
+# def update_user_settings(request):
+#     """Update settings for a user in a profile."""
+#     if request.method == "POST":
+#         data = json.loads(request.body)
+#         profile_user = ProfileUser.objects.get(id=data["profile_user_id"])
+#         profile_user.forward_permission = data.get(
+#             "forward_permission", profile_user.forward_permission
+#         )
+#         profile_user.add_to_queue_permission = data.get(
+#             "add_to_queue_permission", profile_user.add_to_queue_permission
+#         )
+#         profile_user.save()
+#         return JsonResponse({"success": True})

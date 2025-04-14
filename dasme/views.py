@@ -236,7 +236,9 @@ def add_user(request):
         data = json.loads(request.body)
         user = data["user"]
         friend = data["friend"]
-        friendship, created = Friendship.objects.get_or_create(user=user, friend=friend)
+        friendship, created = Friendship.objects.get_or_create(
+            user=User.objects.get(id=user), friend=User.objects.get(id=friend)
+        )
         return JsonResponse({"created": created}, status=200)
 
 
@@ -247,7 +249,8 @@ def edit_perms(request):
         data = json.loads(request.body)
         try:
             friendship = Friendship.objects.get(
-                user=data["user"], friend=data["friend"]
+                user=User.objects.get(id=data["user"]),
+                friend=User.objects.get(id=data["friend"]),
             )
             friendship.can_forward = data.get("can_forward", friendship.can_forward)
             friendship.can_que = data.get("can_que", friendship.can_que)
@@ -265,7 +268,9 @@ def remove_user(request):
         user = data["user"]
         friend = data["friend"]
         try:
-            friendship = Friendship.objects.get(user=user, friend=friend)
+            friendship = Friendship.objects.get(
+                user=User.objects.get(id=user), friend=User.objects.get(id=friend)
+            )
             friendship.delete()
             return JsonResponse({"success": True}, status=200)
         except Friendship.DoesNotExist:
@@ -424,8 +429,7 @@ def que_query(request):
 
             if obj:
                 owner = True
-
-            if not obj:
+            else:
                 # Try to find a ListenParty where the user is connected
                 obj = (
                     ListenParty.objects.prefetch_related("que", "connected")
@@ -437,71 +441,61 @@ def que_query(request):
                 return JsonResponse(
                     {"error": "You are not in a listen party"}, status=404
                 )
-            if obj and owner:
-                user_token = UserToken.objects.get(discord_user_id=user.id)
-                access_token = user_token.access_token
-                refresh_token = user_token.refresh_token
-                url = "https://api.spotify.com/v1/search"
+
+            # Check if user has permission to queue tracks
+            can_queue = owner or (
+                obj
+                and Friendship.objects.filter(user=obj.owner, friend=user).exists()
+                and Friendship.objects.filter(user=obj.owner, friend=user)
+                .first()
+                .can_que
+            )
+
+            if not can_queue:
+                return JsonResponse(
+                    {"error": "You don't have permission to queue tracks"}, status=403
+                )
+
+            # User has permission, proceed with the API request
+            user_token = UserToken.objects.get(discord_user_id=user.id)
+            access_token = user_token.access_token
+            refresh_token = user_token.refresh_token
+            url = "https://api.spotify.com/v1/search"
+            headers = {"Authorization": f"Bearer {access_token}"}
+            params = {"q": query, "type": "track", "limit": 5}
+
+            res = requests.get(url, headers=headers, params=params)
+            if res.status_code == 401:
+                # Token expired, refresh it
+                token_data = refresh_token_util(refresh_token)
+                access_token = token_data["access_token"]
+                refresh_token = token_data["refresh_token"]
+                user_token.access_token = access_token
+                user_token.refresh_token = refresh_token
+                user_token.save()
+
+                # Retry the search with the new token
                 headers = {"Authorization": f"Bearer {access_token}"}
-                params = {"q": query, "type": "track", "limit": 5}
-
                 res = requests.get(url, headers=headers, params=params)
-                if res.status_code == 401:
-                    # Token expired, refresh it
-                    token_data = refresh_token_util(refresh_token)
-                    access_token = token_data["access_token"]
-                    refresh_token = token_data["refresh_token"]
-                    user_token.access_token = access_token
-                    user_token.refresh_token = refresh_token
-                    user_token.save()
-
-                    # Retry the search with the new token
-                    headers = {"Authorization": f"Bearer {access_token}"}
-                    res = requests.get(url, headers=headers, params=params)
-                    if res.status_code != 200:
-                        return JsonResponse(
-                            {"error": "Failed to search for track"}, status=400
-                        )
-                    else:
-                        return res.json().get("tracks", {}).get("items", [])
-                elif res.status_code == 200:
+                if res.status_code != 200:
                     return JsonResponse(
-                        {"data": res.json().get("tracks", {}).get("items", [])}
+                        {"error": "Failed to search for track"}, status=400
                     )
-            elif obj:
-                if Friendship.filter(user=obj.owner, friend=user).can_que:
-                    user_token = UserToken.objects.get(discord_user_id=user.id)
-                    access_token = user_token.access_token
-                    refresh_token = user_token.refresh_token
-                    url = "https://api.spotify.com/v1/search"
-                    headers = {"Authorization": f"Bearer {access_token}"}
-                    params = {"q": query, "type": "track", "limit": 5}
 
-                    res = requests.get(url, headers=headers, params=params)
-                    if res.status_code == 401:
-                        # Token expired, refresh it
-                        token_data = refresh_token_util(refresh_token)
-                        access_token = token_data["access_token"]
-                        refresh_token = token_data["refresh_token"]
-                        user_token.access_token = access_token
-                        user_token.refresh_token = refresh_token
-                        user_token.save()
+            if res.status_code == 200:
+                return JsonResponse(
+                    {"data": res.json().get("tracks", {}).get("items", [])}
+                )
+            else:
+                return JsonResponse(
+                    {"error": f"API request failed with status {res.status_code}"},
+                    status=400,
+                )
 
-                        # Retry the search with the new token
-                        headers = {"Authorization": f"Bearer {access_token}"}
-                        res = requests.get(url, headers=headers, params=params)
-                        if res.status_code != 200:
-                            return JsonResponse(
-                                {"error": "Failed to search for track"}, status=400
-                            )
-                        else:
-                            return res.json().get("tracks", {}).get("items", [])
-                    elif res.status_code == 200:
-                        return JsonResponse(
-                            {"data": res.json().get("tracks", {}).get("items", [])}
-                        )
         except Exception as e:
-            return JsonResponse({"error": e}, status=400)
+            return JsonResponse({"error": str(e)}, status=400)
+
+    return JsonResponse({"error": "Only POST method is allowed"}, status=405)
 
 
 def refresh_token_util(refresh_token):
@@ -528,11 +522,16 @@ def add_to_que(request):
         uri = data["uri"]
         name = data["name"]
         try:
+            owner = False
             obj = (
                 ListenParty.objects.prefetch_related("que", "connected")
                 .filter(owner=user)
                 .first()
             )
+
+            if obj:
+                owner = True
+
             if not obj:
                 # Try to find a ListenParty where the user is connected
                 obj = (
@@ -551,72 +550,84 @@ def add_to_que(request):
                 )
                 obj.que.add(track)
                 endpoint = "https://api.spotify.com/v1/me/player/queue"
-                user_token = UserToken.objects.get(discord_user_id=user.id)
-                access_token = user_token.access_token
-                headers = {"Authorization": f"Bearer {access_token}"}
-                params = {"uri": uri}
-
-                response = requests.post(endpoint, headers=headers, params=params)
-
-                if response.status_code == 204:
-                    return JsonResponse({"success": True}, status=200)
-                elif response.status_code == 401:
-                    # Token expired, refresh it
-                    token_data = refresh_token_util(
-                        UserToken.objects.get(discord_user_id=user.id).refresh_token
-                    )
-                    access_token = token_data["access_token"]
-                    refresh_token = token_data["refresh_token"]
-                    user_token.access_token = access_token
-                    user_token.refresh_token = refresh_token
-                    user_token.save()
-
-                    # Retry the request with the new token
+                if owner:
+                    user_token = UserToken.objects.get(discord_user_id=user.id)
+                    access_token = user_token.access_token
                     headers = {"Authorization": f"Bearer {access_token}"}
+                    params = {"uri": uri}
+
                     response = requests.post(endpoint, headers=headers, params=params)
 
                     if response.status_code == 204:
                         return JsonResponse({"success": True}, status=200)
+                    elif response.status_code == 401:
+                        # Token expired, refresh it
+                        token_data = refresh_token_util(
+                            UserToken.objects.get(discord_user_id=user.id).refresh_token
+                        )
+                        access_token = token_data["access_token"]
+                        refresh_token = token_data["refresh_token"]
+                        user_token.access_token = access_token
+                        user_token.refresh_token = refresh_token
+                        user_token.save()
+
+                        # Retry the request with the new token
+                        headers = {"Authorization": f"Bearer {access_token}"}
+                        response = requests.post(
+                            endpoint, headers=headers, params=params
+                        )
+
+                        if response.status_code == 204:
+                            return JsonResponse({"success": True}, status=200)
+                        else:
+                            return JsonResponse(
+                                {"error": response.text},
+                                status=response.status_code,
+                            )
                     else:
                         return JsonResponse(
                             {"error": response.text},
                             status=response.status_code,
                         )
                 else:
-                    return JsonResponse(
-                        {"error": response.text},
-                        status=response.status_code,
-                    )
+                    user_token = UserToken.objects.get(discord_user_id=obj.owner.id)
+                    access_token = user_token.access_token
+                    headers = {"Authorization": f"Bearer {access_token}"}
+                    params = {"uri": uri}
+
+                    response = requests.post(endpoint, headers=headers, params=params)
+
+                    if response.status_code == 204:
+                        return JsonResponse({"success": True}, status=200)
+                    elif response.status_code == 401:
+                        # Token expired, refresh it
+                        token_data = refresh_token_util(
+                            UserToken.objects.get(discord_user_id=user.id).refresh_token
+                        )
+                        access_token = token_data["access_token"]
+                        refresh_token = token_data["refresh_token"]
+                        user_token.access_token = access_token
+                        user_token.refresh_token = refresh_token
+                        user_token.save()
+
+                        # Retry the request with the new token
+                        headers = {"Authorization": f"Bearer {access_token}"}
+                        response = requests.post(
+                            endpoint, headers=headers, params=params
+                        )
+
+                        if response.status_code == 204:
+                            return JsonResponse({"success": True}, status=200)
+                        else:
+                            return JsonResponse(
+                                {"error": response.text},
+                                status=response.status_code,
+                            )
+                    else:
+                        return JsonResponse(
+                            {"error": response.text},
+                            status=response.status_code,
+                        )
+
         except Exception as e:
             return JsonResponse({"error": str(e)}, status=400)
-
-
-# @csrf_exempt
-# def add_user_to_profile(request):
-#     """Add a user to the profile of the given username."""
-#     if request.method == "POST":
-#         data = json.loads(request.body)
-#         user = User.objects.get(username=data["username"])
-#         profile = Profile.objects.get(
-#             owner=user
-#         )  # Automatically retrieve the user's profile
-#         profile_user, created = ProfileUser.objects.get_or_create(
-#             profile=profile, discord_user_id=data["discord_user_id"]
-#         )
-#         return JsonResponse({"profile_user_id": profile_user.id, "created": created})
-
-
-# @csrf_exempt
-# def update_user_settings(request):
-#     """Update settings for a user in a profile."""
-#     if request.method == "POST":
-#         data = json.loads(request.body)
-#         profile_user = ProfileUser.objects.get(id=data["profile_user_id"])
-#         profile_user.forward_permission = data.get(
-#             "forward_permission", profile_user.forward_permission
-#         )
-#         profile_user.add_to_queue_permission = data.get(
-#             "add_to_queue_permission", profile_user.add_to_queue_permission
-#         )
-#         profile_user.save()
-#         return JsonResponse({"success": True})

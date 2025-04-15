@@ -9,11 +9,6 @@ urlpatterns = [
         views.verify_tokens,
         name="verify_tokens",
     ),
-    path(
-        "api/get_currently_playing/<int:discord_user_id>/",
-        views.get_currently_playing,
-        name="get_currently_playing",
-    ),
     # Profile management routes
     path("api/create_profile/", views.create_profile, name="create_profile"),
     path("api/lp_create/", views.create_lp, name="create_lp"),

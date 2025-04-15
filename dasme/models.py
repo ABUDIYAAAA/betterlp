@@ -28,17 +28,11 @@ class Friendship(models.Model):
         return f"{self.user.username} ↔ {self.friend.username}"
 
 
-class Track(models.Model):
-    song_id = models.CharField(max_length=255, unique=False)
-    song_name = models.CharField(max_length=255, unique=False, blank=True)
-    requester = models.ForeignKey(
-        User, on_delete=models.CASCADE, related_name="requested_tracks"
-    )
-
-
 class ListenParty(models.Model):
-    que = models.ManyToManyField(Track, blank=True, related_name="ques_tracks")
     owner = models.ForeignKey(
         User, on_delete=models.CASCADE, related_name="owner_party"
     )
     connected = models.ManyToManyField(User, blank=True, related_name="connected_users")
+    mobile_lp_users = models.ManyToManyField(
+        User, blank=True, related_name="mobile_lp_users"
+    )

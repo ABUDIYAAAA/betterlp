@@ -21,19 +21,14 @@ urlpatterns = [
     path("api/add_user/", views.add_user, name="add_user"),
     path("api/remove_user/", views.remove_user, name="remove_user"),
     path("api/edit_perms/", views.edit_perms, name="edit_perms"),
-    path("api/remove_user/", views.remove_user, name="remove_user"),
     path("api/join_lp/", views.join_lp, name="join_lp"),
     path("api/leave_lp/", views.leave_lp, name="leave_lp"),
     path("api/que_query/", views.que_query, name="que_query"),
     path("api/add_to_que/", views.add_to_que, name="add_to_que"),
-    #     path(
-    #         "api/add_user_to_profile/",
-    #         views.add_user_to_profile,
-    #         name="add_user_to_profile",
-    #     ),
-    #     path(
-    #         "api/update_user_settings/",
-    #         views.update_user_settings,
-    #         name="update_user_settings",
-    #     ),
+    path(
+        "api/disconnect_spotify/", views.disconnect_spotify, name="disconnect_spotify"
+    ),
+    path("api/forward/", views.forward, name="forward"),
+    path("api/seek/", views.seek, name="seek"),
+    path("api/friends/", views.friends, name="friends"),
 ]

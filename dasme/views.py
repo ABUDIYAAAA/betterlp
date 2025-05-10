@@ -1,16 +1,16 @@
 import requests
-from django.http import HttpResponse, HttpResponseRedirect, JsonResponse
-from django.conf import settings
-from urllib.parse import urlencode
+from django.http import HttpResponse, JsonResponse
 from django.views.decorators.csrf import csrf_exempt
 from .models import UserToken, ListenParty, Friendship
 import json
-from django.shortcuts import redirect, get_object_or_404
+from django.shortcuts import get_object_or_404
 from django.contrib.auth.models import User
+import time
+from django.views.decorators.http import require_GET
 
 # Replace or add these in your settings.py
-CLIENT_ID = "a1358e7bde1741bd9a7d0242d77dd9fb"
-CLIENT_SECRET = "772fe3710f7d4491b8202bf52e1a0b2b"
+CLIENT_ID = "ffd54fb8f0ce49d4a7eb7ec31d0a2f6a"
+CLIENT_SECRET = "178fa9b9c6bc4f4c8261cf632233f36f"
 REDIRECT_URI = r"https://abudiyaaaaa.pythonanywhere.com/callback"
 
 
@@ -31,9 +31,11 @@ def save_tokens(request):
                 "code": code,
                 "redirect_uri": REDIRECT_URI,
                 "client_id": CLIENT_ID,
-                "client_secret": CLIENT_SECRET,  # Spotify Client Secret
+                "client_secret": CLIENT_SECRET,
             },
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
         )
+
         token_data = token_res.json()
 
         if "access_token" in token_data:
@@ -48,6 +50,10 @@ def save_tokens(request):
                 f"<h2>✅ Auth successful!</h2>"
                 f'<p><a href="discord://">Click here to open Discord</a></p>'
             )
+
+        return JsonResponse(
+            {"error": "Token exchange failed", "response": token_data}, status=400
+        )
 
     return JsonResponse({"error": "Method not allowed"}, status=405)
 
@@ -80,6 +86,131 @@ def refresh_token_util(refresh_token):
                 error_message = f"Status code: {response.status_code}, Response: {response.text[:100]}"
 
         return None, error_message
+
+
+@csrf_exempt
+def check_lp_sync(request):
+    if request.method != "POST":
+        return JsonResponse({"error": "Only POST allowed"}, status=405)
+
+    try:
+        data = json.loads(request.body)
+        owner_id = data.get("owner_id")
+        joiner_id = data.get("joiner_id")
+        lp_id = data.get("lp_id")
+
+        if not all([owner_id, joiner_id, lp_id]):
+            return JsonResponse({"error": "Missing fields"}, status=400)
+
+        try:
+            owner = User.objects.get(id=owner_id)
+            joiner = User.objects.get(id=joiner_id)
+            lp = ListenParty.objects.get(id=lp_id, owner=owner)
+
+            # Check if joiner is still connected to this LP
+            if (
+                joiner not in lp.connected.all()
+                and joiner not in lp.mobile_lp_users.all()
+            ):
+                connected_users = [u.username for u in lp.connected.all()]
+                return JsonResponse(
+                    {"status": "remove", "reason": f"not connected: {connected_users}"}, status=200
+                )
+
+            # Optional: ensure they are still friends
+            if not Friendship.objects.filter(user=owner, friend=joiner).exists():
+                return JsonResponse(
+                    {"status": "remove", "reason": "not friends"}, status=200
+                )
+
+            # Get tokens for both users
+            try:
+                owner_token = UserToken.objects.get(discord_user_id=owner_id)
+                joiner_token = UserToken.objects.get(discord_user_id=joiner_id)
+            except UserToken.DoesNotExist:
+                return JsonResponse(
+                    {"status": "remove", "reason": "missing tokens"}, status=200
+                )
+
+            # Refresh owner token if needed
+            owner_token_data, owner_error = refresh_token_util(owner_token.refresh_token)
+            if owner_token_data:
+                owner_token.access_token = owner_token_data["access_token"]
+                if "refresh_token" in owner_token_data:
+                    owner_token.refresh_token = owner_token_data["refresh_token"]
+                owner_token.save()
+            elif owner_error:
+                return JsonResponse(
+                    {"status": "remove", "reason": f"owner token error: {owner_error}"}, status=200
+                )
+
+            # Refresh joiner token if needed
+            joiner_token_data, joiner_error = refresh_token_util(joiner_token.refresh_token)
+            if joiner_token_data: 
+                joiner_token.access_token = joiner_token_data["access_token"]
+                if "refresh_token" in joiner_token_data:
+                    joiner_token.refresh_token = joiner_token_data["refresh_token"]
+                joiner_token.save()
+            elif joiner_error:
+                return JsonResponse(
+                    {"status": "remove", "reason": f"joiner token error: {joiner_error}"}, status=200
+                )
+
+            # Get current tracks
+            owner_playing = get_currently_playing_util(owner_id)
+            joiner_playing = get_currently_playing_util(joiner_id)
+
+            # If host is not playing, skip syncing
+            if not owner_playing.get("is_playing", False):
+                return JsonResponse(
+                    {"status": "ok", "reason": "host not playing"}, status=200
+                )
+
+            # If joiner is not playing or track differs, sync
+            if (
+                not joiner_playing.get("is_playing", False)
+                or joiner_playing.get("track_name") != owner_playing.get("track_name")
+            ):
+                # Make sure we have track URI in owner_playing
+                track_uri = None
+                if "track_uri" in owner_playing:
+                    track_uri = owner_playing["track_uri"]
+                elif "spotify_id" in owner_playing and owner_playing["spotify_id"]:
+                    track_uri = f"spotify:track:{owner_playing['spotify_id']}"
+                
+                if track_uri:
+                    play_result = play_track_util(
+                        joiner_id,
+                        track_uri,
+                        owner_playing.get("progress_ms", 0),
+                    )
+                    if play_result.get("success"):
+                        return JsonResponse({"status": "synced"}, status=200)
+                    else:
+                        return JsonResponse(
+                            {"status": "error", "reason": play_result.get("error", "Unknown play error")}, 
+                            status=200
+                        )
+                else:
+                    return JsonResponse(
+                        {"status": "error", "reason": "Missing track URI"}, status=200
+                    )
+
+            return JsonResponse(
+                {"status": "ok", "reason": "already synced"}, status=200
+            )
+
+        except ListenParty.DoesNotExist:
+            return JsonResponse(
+                {"status": "remove", "reason": "lp not found"}, status=200
+            )
+        except User.DoesNotExist:
+            return JsonResponse(
+                {"status": "remove", "reason": "user not found"}, status=200
+            )
+
+    except Exception as e:
+        return JsonResponse({"error": str(e)}, status=500)
 
 
 @csrf_exempt
@@ -116,13 +247,15 @@ def verify_tokens(request, discord_user_id):
                 if token_data:
                     # Save the new tokens
                     user_token.access_token = token_data["access_token"]
+                    new_access_token = token_data["access_token"]
                     # Not all token refreshes return a new refresh token
                     if "refresh_token" in token_data:
-                        user_token.refresh_token = token_data["refresh_token"]
+                        new_refresh_token = token_data["refresh_token"]
+                        user_token.refresh_token = new_refresh_token
                     user_token.save()
 
                     # Verify the new token works
-                    headers = {"Authorization": f"Bearer {user_token.access_token}"}
+                    headers = {"Authorization": f"Bearer {new_access_token}"}
                     verify_response = requests.get(
                         "https://api.spotify.com/v1/me", headers=headers
                     )
@@ -165,7 +298,7 @@ def verify_tokens(request, discord_user_id):
                     {
                         "linked": True,
                         "valid": False,
-                        "error": f"Spotify API error: {response.status_code}",
+                        "error": f"Spotify API error: {response.status_code} {response.text}",
                         "details": response.text,
                     }
                 )
@@ -346,6 +479,9 @@ def fetch_spotify_queue(access_token, refresh_token):
                         .get("images", [{}])[0]
                         .get("url"),
                         "progress_ms": current_data.get("progress_ms", 0),
+                        "timestamp": current_data.get(
+                            "timestamp", int(time.time() * 1000)
+                        ),  # ✅ ADD THIS
                     }
                 )
 
@@ -381,13 +517,16 @@ def fetch_spotify_queue(access_token, refresh_token):
 def add_user(request):
     """Add a user to the profile of the given username."""
     if request.method == "POST":
-        data = json.loads(request.body)
-        user = data["user"]
-        friend = data["friend"]
-        friendship, created = Friendship.objects.get_or_create(
-            user=User.objects.get(id=user), friend=User.objects.get(id=friend)
-        )
-        return JsonResponse({"created": created}, status=200)
+        try:
+            data = json.loads(request.body)
+            user = data["user"]
+            friend = data["friend"]
+            friendship, created = Friendship.objects.get_or_create(
+                user=User.objects.get(id=user), friend=User.objects.get(id=friend)
+            )
+            return JsonResponse({"created": created}, status=200)
+        except Exception as e:
+            return JsonResponse({"error": str(e)})
 
 
 @csrf_exempt
@@ -451,19 +590,15 @@ def forward(request):
         return JsonResponse({"error": "Only POST allowed"}, status=405)
 
     data = json.loads(request.body)
-    user = data["user"]
+    user = User.objects.get(id=data["user"])
 
     # Try as owner
-    obj = (
-        ListenParty.objects.prefetch_related("que", "connected")
-        .filter(owner=user)
-        .first()
-    )
+    obj = ListenParty.objects.prefetch_related("connected").filter(owner=user).first()
 
     if not obj:
         # Try as connected user
         obj = (
-            ListenParty.objects.prefetch_related("que", "connected")
+            ListenParty.objects.prefetch_related("connected")
             .filter(connected=user)
             .first()
         )
@@ -499,83 +634,47 @@ def forward(request):
     return JsonResponse({"error": response.text}, status=response.status_code)
 
 
-def try_seek(access_token, position_ms):
-    return requests.put(
-        "https://api.spotify.com/v1/me/player/seek",
-        headers={"Authorization": f"Bearer {access_token}"},
-        params={"position_ms": position_ms},
-    )
+def play_track_util(discord_user_id, track_uri, progress_ms):
+    """Plays the specified track for a user at the given progress position."""
+    try:
+        # Get user's token
+        user_token = UserToken.objects.get(discord_user_id=discord_user_id)
+        access_token = user_token.access_token
 
+        headers = {
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json",
+        }
 
-def refresh_and_retry_seek(tokens, position_ms):
-    token_data, error = refresh_token_util(tokens.refresh_token)
-    if not token_data:
-        return None, JsonResponse({"error": error}, status=400)
+        data = {
+            "uris": [track_uri],
+            "position_ms": progress_ms,
+        }
 
-    tokens.access_token = token_data["access_token"]
-    if "refresh_token" in token_data:
-        tokens.refresh_token = token_data["refresh_token"]
-    tokens.save()
-
-    return try_seek(tokens.access_token, position_ms), None
-
-
-@csrf_exempt
-def seek(request):
-    if request.method != "POST":
-        return JsonResponse({"error": "Only POST allowed"}, status=405)
-
-    data = json.loads(request.body)
-    user = data["user"]
-    position_ms = data.get("position_ms")
-
-    if position_ms is None:
-        return JsonResponse({"error": "Missing position_ms"}, status=400)
-
-    # Try as owner
-    obj = (
-        ListenParty.objects.prefetch_related("que", "connected")
-        .filter(owner=user)
-        .first()
-    )
-
-    if not obj:
-        # Try as connected user
-        obj = (
-            ListenParty.objects.prefetch_related("que", "connected")
-            .filter(connected=user)
-            .first()
+        response = requests.put(
+            "https://api.spotify.com/v1/me/player/play", headers=headers, json=data
         )
-        if not obj:
-            return JsonResponse(
-                {"error": "You are not in a listening party"}, status=404
-            )
 
-        if not Friendship.objects.filter(
-            user=obj.owner, friend=user, can_forward=True
-        ).exists():
-            return JsonResponse({"error": "You are not allowed to seek"}, status=403)
-
-        tokens = UserToken.objects.get(discord_user_id=obj.owner.id)
-    else:
-        tokens = UserToken.objects.get(discord_user_id=user.id)
-
-    response = try_seek(tokens.access_token, position_ms)
-    if response.status_code == 204:
-        return JsonResponse({"success": True}, status=200)
-    elif response.status_code == 401:
-        refreshed_response, error_response = refresh_and_retry_seek(tokens, position_ms)
-        if error_response:
-            return error_response
-        if refreshed_response.status_code == 204:
-            return JsonResponse({"success": True}, status=200)
+        if response.status_code == 204:
+            return {"success": True}
+        elif response.status_code == 401:
+            # Refresh token if expired
+            token_data, error = refresh_token_util(user_token.refresh_token)
+            if token_data:
+                user_token.access_token = token_data["access_token"]
+                if "refresh_token" in token_data:
+                    user_token.refresh_token = token_data["refresh_token"]
+                user_token.save()
+                return play_track_util(discord_user_id, track_uri, progress_ms)
+            else:
+                return {"error": f"Token refresh failed: {error}"}
         else:
-            return JsonResponse(
-                {"error": refreshed_response.text},
-                status=refreshed_response.status_code,
-            )
+            return {
+                "error": f"Failed to play track. Status: {response.status_code}, Response: {response.text}"
+            }
 
-    return JsonResponse({"error": response.text}, status=response.status_code)
+    except UserToken.DoesNotExist:
+        return {"error": "User token not found"}
 
 
 def get_currently_playing_util(discord_user_id):
@@ -636,95 +735,116 @@ def get_currently_playing_util(discord_user_id):
         return {"error": "User token not found"}
 
 
+@require_GET
+@csrf_exempt
+def get_mobile_lp_users(request):
+    results = []
+
+    for lp in ListenParty.objects.prefetch_related("mobile_lp_users").all():
+        owner_id = lp.owner.id
+        lp_id = lp.id
+        for mobile_user in lp.mobile_lp_users.all():
+            results.append(
+                {
+                    "owner_id": owner_id,
+                    "joiner_id": mobile_user.id,
+                    "lp_id": lp_id,
+                }
+            )
+
+    return JsonResponse({"data": results})
+
+
 @csrf_exempt
 def join_lp(request):
     """Join a listening party."""
-    if request.method == "POST":
-        data = json.loads(request.body)
-        user = User.objects.get(id=data["user"])
-        friend = User.objects.get(id=data["friend"])
-        mobile = data.get("mobile", False)
-        if not mobile:
-            obj = (
-                ListenParty.objects.prefetch_related("que", "connected")
-                .filter(owner=friend)
-                .first()
-            )
-            if obj:
-                return JsonResponse(
-                    {"error": "You are already hosting a lp"}, status=403
-                )
-
-            if not obj:
-                # Try to find a ListenParty where the user is connected
+    try:
+        if request.method == "POST":
+            data = json.loads(request.body)
+            user = User.objects.get(id=data["user"])
+            friend = User.objects.get(id=data["friend"])
+            mobile = data.get("mobile", False)
+            if not mobile:
                 obj = (
-                    ListenParty.objects.prefetch_related("que", "connected")
-                    .filter(connected=friend)
+                    ListenParty.objects.prefetch_related("connected")
+                    .filter(owner=friend)
                     .first()
                 )
                 if obj:
                     return JsonResponse(
-                        {"error": "You are already in a lp"}, status=403
+                        {"error": "You are already hosting a lp"}, status=403
                     )
 
-            if not obj:
-                if Friendship.objects.filter(user=user, friend=friend).exists():
-                    if ListenParty.objects.filter(owner=user).exists():
-                        in_lp = False
-                        user_s = get_currently_playing_util(user.id)
-                        friend_s = get_currently_playing_util(friend.id)
-                        if user_s["is_playing"] and friend_s["is_playing"]:
-                            if user_s["track_name"] == friend_s["track_name"]:
-                                in_lp = True
-                        if in_lp:
-                            try:
-                                lp = ListenParty.objects.get(owner=user)
-                                lp.connected.add(friend)
-                                lp.save()
-                                return JsonResponse({"success": True}, status=200)
-                            except ListenParty.DoesNotExist:
+                if not obj:
+                    # Try to find a ListenParty where the user is connected
+                    obj = (
+                        ListenParty.objects.prefetch_related("connected")
+                        .filter(connected=friend)
+                        .first()
+                    )
+                    if obj:
+                        return JsonResponse(
+                            {"error": "You are already in a lp"}, status=403
+                        )
+
+                if not obj:
+                    if Friendship.objects.filter(user=user, friend=friend).exists():
+                        if ListenParty.objects.filter(owner=user).exists():
+                            in_lp = False
+                            user_s = get_currently_playing_util(user.id)
+                            friend_s = get_currently_playing_util(friend.id)
+                            if user_s["is_playing"] and friend_s["is_playing"]:
+                                if user_s["track_name"] == friend_s["track_name"]:
+                                    in_lp = True
+                            if in_lp:
+                                try:
+                                    lp = ListenParty.objects.get(owner=user)
+                                    lp.connected.add(friend)
+                                    lp.save()
+                                    return JsonResponse({"success": True}, status=200)
+                                except ListenParty.DoesNotExist:
+                                    return JsonResponse(
+                                        {"error": "Listening party not found"},
+                                        status=404,
+                                    )
+                            else:
                                 return JsonResponse(
-                                    {"error": "Listening party not found"}, status=404
+                                    {"error": "You are not in an lp"}, status=403
                                 )
                         else:
                             return JsonResponse(
-                                {"error": "You are not in an lp"}, status=403
+                                {"error": "That user is not hosting a listen party"},
+                                status=403,
                             )
                     else:
-                        return JsonResponse(
-                            {"error": "That user is not hosting a listen party"},
-                            status=403,
-                        )
-                else:
-                    return JsonResponse({"error": "User not added"}, status=404)
-        else:
-            if ListenParty.objects.filter(owner=user).exists():
-                return JsonResponse(
-                    {"error": "You are already hosting a lp"}, status=403
-                )
-            obj = (
-                ListenParty.objects.prefetch_related("que", "connected")
-                .filter(owner=friend)
-                .first()
-            )
-            if obj:
-                if Friendship.objects.filter(user=user, friend=friend).exists():
-                    try:
-                        lp = ListenParty.objects.get(owner=friend)
-                        lp.mobile_lp_users.add(user)
-                        lp.save()
-                        return JsonResponse({"success": True}, status=200)
-                    except ListenParty.DoesNotExist:
-                        return JsonResponse(
-                            {"error": "Listening party not found"}, status=404
-                        )
-                else:
-                    return JsonResponse({"error": "User not added"}, status=404)
-
+                        return JsonResponse({"error": "User not added"}, status=404)
             else:
-                return JsonResponse(
-                    {"error": "That user is not hosting a listen party"}, status=403
-                )
+                if ListenParty.objects.filter(owner=friend).exists():
+                    return JsonResponse(
+                        {"error": "You are already hosting a lp"}, status=403
+                    )
+                obj = ListenParty.objects.filter(owner=user).first()
+                if obj:
+                    if Friendship.objects.filter(user=user, friend=friend).exists():
+                        try:
+                            lp = ListenParty.objects.get(owner=user)
+                            lp.connected.add(friend)
+                            lp.mobile_lp_users.add(friend)
+                            lp.save()
+                            return JsonResponse({"success": True}, status=200)
+                        except ListenParty.DoesNotExist:
+                            return JsonResponse(
+                                {"error": "Listening party not found"}, status=404
+                            )
+                    else:
+                        return JsonResponse({"error": "User not added"}, status=404)
+
+                else:
+                    return JsonResponse(
+                        {"error": "That user is not hosting a listen party"}, status=403
+                    )
+    except Exception as e:
+        return JsonResponse({"error": str(e)}, status=500)
 
 
 @csrf_exempt
@@ -736,9 +856,7 @@ def leave_lp(request):
 
         # Try to find a ListenParty the user owns
         obj = (
-            ListenParty.objects.prefetch_related("que", "connected")
-            .filter(owner=user)
-            .first()
+            ListenParty.objects.prefetch_related("connected").filter(owner=user).first()
         )
         if obj:
             obj.delete()
@@ -747,7 +865,7 @@ def leave_lp(request):
         if not obj:
             # Try to find a ListenParty where the user is connected
             obj = (
-                ListenParty.objects.prefetch_related("que", "connected")
+                ListenParty.objects.prefetch_related("connected")
                 .filter(connected=user)
                 .first()
             )
@@ -758,7 +876,7 @@ def leave_lp(request):
         if not obj:
             # Try to find a ListenParty where the user is a mobile user
             obj = (
-                ListenParty.objects.prefetch_related("que", "connected")
+                ListenParty.objects.prefetch_related("connected")
                 .filter(mobile_lp_users=user)
                 .first()
             )
@@ -781,7 +899,7 @@ def que_query(request):
         try:
             owner = False
             obj = (
-                ListenParty.objects.prefetch_related("que", "connected")
+                ListenParty.objects.prefetch_related("connected")
                 .filter(owner=user)
                 .first()
             )
@@ -791,7 +909,7 @@ def que_query(request):
             else:
                 # Try to find a ListenParty where the user is connected
                 obj = (
-                    ListenParty.objects.prefetch_related("que", "connected")
+                    ListenParty.objects.prefetch_related("connected")
                     .filter(connected=user)
                     .first()
                 )
@@ -799,7 +917,7 @@ def que_query(request):
             if not obj:
                 # Try to find a ListenParty where the user is a mobile user
                 obj = (
-                    ListenParty.objects.prefetch_related("que", "connected")
+                    ListenParty.objects.prefetch_related("connected")
                     .filter(mobile_lp_users=user)
                     .first()
                 )
@@ -882,14 +1000,9 @@ def que_query(request):
 def get_listen_party(user):
     """Get ListenParty where user is owner or connected."""
     return (
-        ListenParty.objects.prefetch_related("que", "connected", "mobile_lp_users")
-        .filter(owner=user)
-        .first()
-        or ListenParty.objects.prefetch_related("que", "connected", "mobile_lp_users")
+        ListenParty.objects.prefetch_related("connected").filter(owner=user).first()
+        or ListenParty.objects.prefetch_related("connected")
         .filter(connected=user)
-        .first()
-        or ListenParty.objects.prefetch_related("que", "connected", "mobile_lp_users")
-        .filter(mobile_lp_users=user)
         .first()
     )
 
@@ -898,74 +1011,69 @@ def refresh_and_retry_token(user_token, uri):
     token_data, error = refresh_token_util(user_token.refresh_token)
     if not token_data:
         return None, error
-
     user_token.access_token = token_data["access_token"]
     if "refresh_token" in token_data:
         user_token.refresh_token = token_data["refresh_token"]
     user_token.save()
-
     headers = {"Authorization": f"Bearer {user_token.access_token}"}
-    verify_response = requests.get("https://api.spotify.com/v1/me", headers=headers)
-    if verify_response.status_code == 200:
-        return make_spotify_request(user_token.access_token, uri)
-    return None, "Token refresh failed"
+    try:
+        verify_response = requests.get("https://api.spotify.com/v1/me", headers=headers)
+        if verify_response.status_code == 200:
+            return make_spotify_request(user_token.access_token, uri)
+        else:
+            return (
+                None,
+                f"Token refresh failed with status code {verify_response.status_code}",
+            )
+    except requests.exceptions.RequestException as e:
+        return None, str(e)
 
 
 def make_spotify_request(access_token, uri):
     endpoint = "https://api.spotify.com/v1/me/player/queue"
     headers = {"Authorization": f"Bearer {access_token}"}
     params = {"uri": uri}
-    response = requests.post(endpoint, headers=headers, params=params)
-    return response, None
-
-
-def try_mobile_users(mobile_users, uri):
-    for mobile_user in mobile_users:
-        try:
-            tokens = UserToken.objects.get(discord_user_id=mobile_user.id)
-            response, _ = make_spotify_request(tokens.access_token, uri)
-
-            if response.status_code == 204:
-                return JsonResponse({"success": True}, status=200)
-            elif response.status_code == 401:
-                response, error = refresh_and_retry_token(tokens, uri)
-                if response and response.status_code == 204:
-                    return JsonResponse({"success": True}, status=200)
-        except UserToken.DoesNotExist:
-            continue
-    return JsonResponse({"error": "Token expired or user not found"}, status=400)
+    try:
+        response = requests.post(endpoint, headers=headers, params=params)
+        return response, None
+    except requests.exceptions.RequestException as e:
+        return None, str(e)
 
 
 @csrf_exempt
 def add_to_que(request):
     if request.method != "POST":
         return JsonResponse({"error": "Invalid method"}, status=405)
-
     try:
         data = json.loads(request.body)
         user = get_object_or_404(User, id=data["user"])
         uri = data["uri"]
-
         party = get_listen_party(user)
         if not party:
             return JsonResponse({"error": "You are not in a listen party"}, status=404)
-
         is_owner = party.owner == user
         user_token = UserToken.objects.get(
             discord_user_id=user.id if is_owner else party.owner.id
         )
-
-        response, _ = make_spotify_request(user_token.access_token, uri)
-        if response.status_code == 204:
-            return JsonResponse({"success": True}, status=200)
-        elif response.status_code == 401:
-            response, error = refresh_and_retry_token(user_token, uri)
-            if response and response.status_code == 204:
+        response, error = make_spotify_request(user_token.access_token, uri)
+        if response:
+            if response.status_code == 204:
                 return JsonResponse({"success": True}, status=200)
-
-        # Try mobile users as fallback
-        return try_mobile_users(party.mobile_lp_users.all(), uri)
-
+            elif response.status_code == 401:
+                response, error = refresh_and_retry_token(user_token, uri)
+                if response and response.status_code == 204:
+                    return JsonResponse({"success": True}, status=200)
+                else:
+                    return JsonResponse({"error": error or "Unauthorized"}, status=401)
+            else:
+                return JsonResponse(
+                    {"error": f"Spotify API error: {response.status_code}"},
+                    status=response.status_code,
+                )
+        else:
+            return JsonResponse(
+                {"error": error or "No response from Spotify API"}, status=400
+            )
     except Exception as e:
         return JsonResponse({"error": str(e)}, status=400)
 
@@ -999,17 +1107,165 @@ def disconnect_spotify(request):
 @csrf_exempt
 def friends(request):
     if request.method == "POST":
+        try:
+            data = json.loads(request.body)
+            user = User.objects.get(id=data["user"])
+            friends = Friendship.objects.filter(user=user).select_related("friend")
+            friend_list = [
+                {
+                    "id": f.friend.id,
+                    "name": f.friend.username,
+                    "can_forward": f.can_forward,
+                    "can_que": f.can_que,  # Added this field to track queue permissions
+                }
+                for f in friends
+            ]
+            return JsonResponse({"friends": friend_list}, status=200)
+        except User.DoesNotExist:
+            return JsonResponse({"error": "User not found"}, status=404)
+        except Exception as e:
+            return JsonResponse({"error": str(e)}, status=500)
+    return JsonResponse({"error": "Only POST method is allowed"}, status=405)
+
+
+@csrf_exempt
+def check_current_playing(request):
+    """Get the currently playing track for a user."""
+    if request.method != "POST":
+        return JsonResponse({"error": "Only POST method is allowed"}, status=405)
+
+    try:
         data = json.loads(request.body)
-        user = User.objects.get(id=data["user"])
-        friends = Friendship.objects.filter(user=user).select_related("friend")
+        discord_user_id = data.get("user_id")
 
-        friend_list = [
-            {
-                "id": f.friend.id,
-                "name": f.friend.username,
-                "can_forward": f.can_forward,
+        if not discord_user_id:
+            return JsonResponse({"error": "Missing user_id parameter"}, status=400)
+
+        # Try to get the token for the user
+        try:
+            user_token = UserToken.objects.get(discord_user_id=discord_user_id)
+        except UserToken.DoesNotExist:
+            return JsonResponse({"error": "User not connected to Spotify"}, status=404)
+
+        access_token = user_token.access_token
+        refresh_token = user_token.refresh_token
+
+        # Call Spotify API to get currently playing
+        headers = {"Authorization": f"Bearer {access_token}"}
+        response = requests.get(
+            "https://api.spotify.com/v1/me/player/currently-playing", headers=headers
+        )
+
+        # Handle different response status codes
+        if response.status_code == 204:
+            return JsonResponse(
+                {"is_playing": False, "message": "No track currently playing"}
+            )
+
+        elif response.status_code == 200:
+            data = response.json()
+
+            if not data or not data.get("item"):
+                return JsonResponse(
+                    {"is_playing": False, "message": "No track details available"}
+                )
+
+            track = data["item"]
+            is_playing = data.get("is_playing", False)
+
+            result = {
+                "is_playing": is_playing,
+                "track_name": track.get("name", "Unknown"),
+                "artist_name": ", ".join(
+                    [artist["name"] for artist in track.get("artists", [])]
+                ),
+                "album": track.get("album", {}).get("name", "Unknown"),
+                "duration_ms": track.get("duration_ms", 0),
+                "progress_ms": data.get("progress_ms", 0),
+                "album_art": track.get("album", {})
+                .get("images", [{}])[0]
+                .get("url", ""),
+                "spotify_url": track.get("external_urls", {}).get("spotify", ""),
+                "timestamp": data.get("timestamp", 0),
             }
-            for f in friends
-        ]
 
-        return JsonResponse({"friends": friend_list}, status=200)
+            return JsonResponse(result)
+
+        elif response.status_code == 401:
+            # Token expired, try to refresh
+            token_data, error = refresh_token_util(refresh_token)
+
+            if not token_data:
+                return JsonResponse(
+                    {"error": f"Failed to refresh token: {error}"}, status=401
+                )
+
+            # Update tokens in database
+            user_token.access_token = token_data["access_token"]
+            if "refresh_token" in token_data:
+                user_token.refresh_token = token_data["refresh_token"]
+            user_token.save()
+
+            # Retry the request with new token
+            headers = {"Authorization": f"Bearer {token_data['access_token']}"}
+            response = requests.get(
+                "https://api.spotify.com/v1/me/player/currently-playing",
+                headers=headers,
+            )
+
+            if response.status_code == 200:
+                data = response.json()
+
+                if not data or not data.get("item"):
+                    return JsonResponse(
+                        {"is_playing": False, "message": "No track details available"}
+                    )
+
+                track = data["item"]
+                is_playing = data.get("is_playing", False)
+
+                result = {
+                    "is_playing": is_playing,
+                    "track_name": track.get("name", "Unknown"),
+                    "artist_name": ", ".join(
+                        [artist["name"] for artist in track.get("artists", [])]
+                    ),
+                    "album": track.get("album", {}).get("name", "Unknown"),
+                    "duration_ms": track.get("duration_ms", 0),
+                    "progress_ms": data.get("progress_ms", 0),
+                    "album_art": track.get("album", {})
+                    .get("images", [{}])[0]
+                    .get("url", ""),
+                    "spotify_url": track.get("external_urls", {}).get("spotify", ""),
+                    "timestamp": data.get("timestamp", 0),
+                }
+
+                return JsonResponse(result)
+
+            elif response.status_code == 204:
+                return JsonResponse(
+                    {"is_playing": False, "message": "No track currently playing"}
+                )
+
+            else:
+                return JsonResponse(
+                    {"error": f"API request failed with status {response.status_code}"},
+                    status=response.status_code,
+                )
+
+        else:
+            return JsonResponse(
+                {"error": f"API request failed with status {response.status_code}"},
+                status=response.status_code,
+            )
+
+    except UserToken.DoesNotExist:
+        return JsonResponse({"error": "User not connected to Spotify"}, status=404)
+
+    except json.JSONDecodeError:
+        return JsonResponse({"error": "Invalid JSON in request body"}, status=400)
+
+    except Exception as e:
+        # Log the exception for debugging
+        print(f"Error in check_current_playing: {str(e)}")
+        return JsonResponse({"error": str(e)}, status=500)

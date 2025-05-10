@@ -24,6 +24,8 @@ urlpatterns = [
         "api/disconnect_spotify/", views.disconnect_spotify, name="disconnect_spotify"
     ),
     path("api/forward/", views.forward, name="forward"),
-    path("api/seek/", views.seek, name="seek"),
     path("api/friends/", views.friends, name="friends"),
+    path("api/currently_playing/", views.check_current_playing, name="playing"),
+    path("api/mobile-sync/", views.check_lp_sync, name="sync"),
+    path("api/get-mobile-lps", views.get_mobile_lp_users),
 ]

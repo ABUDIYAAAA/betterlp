@@ -109,7 +109,7 @@ def check_lp_sync(request):
             connected = [l.id for l in lp.connected.all()]
             if joiner_id not in connected and lp.owner.id != owner_id:
                 return JsonResponse(
-                    {"status": "remove", "reason": "not connected"}, status=200
+                    {"status": "remove", "reason": connected}, status=200
                 )
 
             # Optional: ensure they are still friends

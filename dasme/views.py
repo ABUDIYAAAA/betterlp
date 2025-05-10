@@ -103,57 +103,49 @@ def check_lp_sync(request):
             return JsonResponse({"error": "Missing fields"}, status=400)
 
         try:
-            owner = User.objects.get(id=owner_id)
-            joiner = User.objects.get(id=joiner_id)
-            lp = ListenParty.objects.get(id=lp_id, owner=owner)
+            lp = ListenParty.objects.get(id=lp_id)
 
             # Check if joiner is still connected to this LP
-            if (
-                joiner not in lp.connected.all()
-                and joiner not in lp.mobile_lp_users.all()
-            ):
-                connected_users = [u.username for u in lp.connected.all()]
+            connected = [l.id for l in lp.connected.all()]
+            if joiner_id not in connected and lp.owner.id != owner_id:
                 return JsonResponse(
-                    {"status": "remove", "reason": f"not connected: {connected_users}"}, status=200
+                    {"status": "remove", "reason": "not connected"}, status=200
                 )
 
             # Optional: ensure they are still friends
-            if not Friendship.objects.filter(user=owner, friend=joiner).exists():
-                return JsonResponse(
-                    {"status": "remove", "reason": "not friends"}, status=200
-                )
 
-            # Get tokens for both users
+            # Refresh both tokens
+            owner = None
+            joiner = None
             try:
-                owner_token = UserToken.objects.get(discord_user_id=owner_id)
-                joiner_token = UserToken.objects.get(discord_user_id=joiner_id)
+                owner = UserToken.objects.get(discord_user_id=owner_id)
             except UserToken.DoesNotExist:
                 return JsonResponse(
-                    {"status": "remove", "reason": "missing tokens"}, status=200
+                    {"status": "remove", "reason": "owner token not found"}, status=200
+                )
+            try:
+                joiner = UserToken.objects.get(discord_user_id=joiner_id)
+
+            except UserToken.DoesNotExist:
+                return JsonResponse(
+                    {"status": "remove", "reason": "joiner token not found"}, status=200
                 )
 
-            # Refresh owner token if needed
-            owner_token_data, owner_error = refresh_token_util(owner_token.refresh_token)
-            if owner_token_data:
-                owner_token.access_token = owner_token_data["access_token"]
-                if "refresh_token" in owner_token_data:
-                    owner_token.refresh_token = owner_token_data["refresh_token"]
-                owner_token.save()
-            elif owner_error:
+            token1, error1 = refresh_token_util(owner.refresh_token)
+            token2, error2 = refresh_token_util(joiner.refresh_token)
+            if token1:
+                owner.access_token = token1["access_token"]
+                if "refresh_token" in token1:
+                    owner.refresh_token = token1["refresh_token"]
+                owner.save()
+            if token2:
+                joiner.access_token = token2["access_token"]
+                if "refresh_token" in token2:
+                    joiner.refresh_token = token2["refresh_token"]
+                joiner.save()
+            if not token1 or not token2:
                 return JsonResponse(
-                    {"status": "remove", "reason": f"owner token error: {owner_error}"}, status=200
-                )
-
-            # Refresh joiner token if needed
-            joiner_token_data, joiner_error = refresh_token_util(joiner_token.refresh_token)
-            if joiner_token_data: 
-                joiner_token.access_token = joiner_token_data["access_token"]
-                if "refresh_token" in joiner_token_data:
-                    joiner_token.refresh_token = joiner_token_data["refresh_token"]
-                joiner_token.save()
-            elif joiner_error:
-                return JsonResponse(
-                    {"status": "remove", "reason": f"joiner token error: {joiner_error}"}, status=200
+                    {"status": "remove", "reason": [error1, error2]}, status=200
                 )
 
             # Get current tracks
@@ -161,40 +153,22 @@ def check_lp_sync(request):
             joiner_playing = get_currently_playing_util(joiner_id)
 
             # If host is not playing, skip syncing
-            if not owner_playing.get("is_playing", False):
+            if not owner_playing["is_playing"]:
                 return JsonResponse(
                     {"status": "ok", "reason": "host not playing"}, status=200
                 )
 
             # If joiner is not playing or track differs, sync
             if (
-                not joiner_playing.get("is_playing", False)
-                or joiner_playing.get("track_name") != owner_playing.get("track_name")
+                not joiner_playing["is_playing"]
+                or joiner_playing["track_uri"] != owner_playing["track_uri"]
             ):
-                # Make sure we have track URI in owner_playing
-                track_uri = None
-                if "track_uri" in owner_playing:
-                    track_uri = owner_playing["track_uri"]
-                elif "spotify_id" in owner_playing and owner_playing["spotify_id"]:
-                    track_uri = f"spotify:track:{owner_playing['spotify_id']}"
-                
-                if track_uri:
-                    play_result = play_track_util(
-                        joiner_id,
-                        track_uri,
-                        owner_playing.get("progress_ms", 0),
-                    )
-                    if play_result.get("success"):
-                        return JsonResponse({"status": "synced"}, status=200)
-                    else:
-                        return JsonResponse(
-                            {"status": "error", "reason": play_result.get("error", "Unknown play error")}, 
-                            status=200
-                        )
-                else:
-                    return JsonResponse(
-                        {"status": "error", "reason": "Missing track URI"}, status=200
-                    )
+                play_track_util(
+                    user_id=joiner_id,
+                    track_uri=owner_playing["track_uri"],
+                    progress_ms=owner_playing["progress_ms"],
+                )
+                return JsonResponse({"status": "synced"}, status=200)
 
             return JsonResponse(
                 {"status": "ok", "reason": "already synced"}, status=200
@@ -203,10 +177,6 @@ def check_lp_sync(request):
         except ListenParty.DoesNotExist:
             return JsonResponse(
                 {"status": "remove", "reason": "lp not found"}, status=200
-            )
-        except User.DoesNotExist:
-            return JsonResponse(
-                {"status": "remove", "reason": "user not found"}, status=200
             )
 
     except Exception as e:
@@ -673,64 +643,6 @@ def play_track_util(discord_user_id, track_uri, progress_ms):
                 "error": f"Failed to play track. Status: {response.status_code}, Response: {response.text}"
             }
 
-    except UserToken.DoesNotExist:
-        return {"error": "User token not found"}
-
-
-def get_currently_playing_util(discord_user_id):
-    try:
-        # Step 1: Retrieve the user's token
-        user_token = UserToken.objects.get(discord_user_id=discord_user_id)
-        access_token = user_token.access_token
-
-        # Step 2: Use the Spotify API to fetch the currently playing track
-        headers = {"Authorization": f"Bearer {access_token}"}
-        response = requests.get(
-            "https://api.spotify.com/v1/me/player/currently-playing", headers=headers
-        )
-
-        if response.status_code == 200:
-            data = response.json()
-            if data and data.get("is_playing"):
-                track_name = data["item"]["name"]
-                artist_name = ", ".join(
-                    artist["name"] for artist in data["item"]["artists"]
-                )
-                duration_ms = data["item"]["duration_ms"]
-                progress_ms = data["progress_ms"]
-
-                return {
-                    "is_playing": True,
-                    "track_name": track_name,
-                    "artist_name": artist_name,
-                    "duration_ms": duration_ms,
-                    "progress_ms": progress_ms,
-                }
-
-            else:
-                return {"is_playing": False, "message": "Not playing anything"}
-
-        elif response.status_code == 401:
-            token_data, error = refresh_token_util(user_token.refresh_token)
-
-            if token_data:
-                # Save the new tokens
-                user_token.access_token = token_data["access_token"]
-                # Not all token refreshes return a new refresh token
-                if "refresh_token" in token_data:
-                    user_token.refresh_token = token_data["refresh_token"]
-                user_token.save()
-
-                # Verify the new token works
-                headers = {"Authorization": f"Bearer {user_token.access_token}"}
-                verify_response = requests.get(
-                    "https://api.spotify.com/v1/me", headers=headers
-                )
-
-                if verify_response.status_code == 200:
-                    return get_currently_playing_util(discord_user_id)
-        else:
-            return {"error": "Failed to fetch currently playing track"}
     except UserToken.DoesNotExist:
         return {"error": "User token not found"}
 
@@ -1269,3 +1181,61 @@ def check_current_playing(request):
         # Log the exception for debugging
         print(f"Error in check_current_playing: {str(e)}")
         return JsonResponse({"error": str(e)}, status=500)
+
+
+def get_currently_playing_util(discord_user_id):
+    try:
+        # Step 1: Retrieve the user's token
+        user_token = UserToken.objects.get(discord_user_id=discord_user_id)
+        access_token = user_token.access_token
+
+        # Step 2: Use the Spotify API to fetch the currently playing track
+        headers = {"Authorization": f"Bearer {access_token}"}
+        response = requests.get(
+            "https://api.spotify.com/v1/me/player/currently-playing", headers=headers
+        )
+
+        if response.status_code == 200:
+            data = response.json()
+            if data and data.get("is_playing"):
+                track_name = data["item"]["name"]
+                artist_name = ", ".join(
+                    artist["name"] for artist in data["item"]["artists"]
+                )
+                duration_ms = data["item"]["duration_ms"]
+                progress_ms = data["progress_ms"]
+
+                return {
+                    "is_playing": True,
+                    "track_name": track_name,
+                    "artist_name": artist_name,
+                    "duration_ms": duration_ms,
+                    "progress_ms": progress_ms,
+                }
+
+            else:
+                return {"is_playing": False, "message": "Not playing anything"}
+
+        elif response.status_code == 401:
+            token_data, error = refresh_token_util(user_token.refresh_token)
+
+            if token_data:
+                # Save the new tokens
+                user_token.access_token = token_data["access_token"]
+                # Not all token refreshes return a new refresh token
+                if "refresh_token" in token_data:
+                    user_token.refresh_token = token_data["refresh_token"]
+                user_token.save()
+
+                # Verify the new token works
+                headers = {"Authorization": f"Bearer {user_token.access_token}"}
+                verify_response = requests.get(
+                    "https://api.spotify.com/v1/me", headers=headers
+                )
+
+                if verify_response.status_code == 200:
+                    return get_currently_playing_util(discord_user_id)
+        else:
+            return {"error": "Failed to fetch currently playing track"}
+    except UserToken.DoesNotExist:
+        return {"error": "User token not found"}
